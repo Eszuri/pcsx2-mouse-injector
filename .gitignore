@@ -1,0 +1,8 @@
+# Rust build target
+/target/
+/state/
+**/*.rs.bk
+
+# Runtime files
+*.log
+mouseinjector.json
