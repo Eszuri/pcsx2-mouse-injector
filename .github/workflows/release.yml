@@ -5,6 +5,12 @@ on:
     tags:
       - '*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release Version (e.g. v1.0.0)'
+        required: false
+        default: 'v1.0.0'
+        type: string
 
 permissions:
   contents: write
@@ -18,6 +24,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Determine Version
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($ver)) {
+            $ver = "${{ github.ref_name }}"
+          }
+          if ([string]::IsNullOrWhiteSpace($ver) -or $ver -eq "main") {
+            $ver = "v1.0.0"
+          }
+          echo "VERSION=$ver" >> $env:GITHUB_ENV
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -26,10 +44,24 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Build Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (Test-Path $iscc) {
+            & $iscc /DAppVersion="${{ env.VERSION }}" installer.iss
+          } else {
+            iscc /DAppVersion="${{ env.VERSION }}" installer.iss
+          }
+
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          name: PCSX2 Mouse Injector ${{ github.ref_name }}
+          name: PCSX2 Mouse Injector ${{ env.VERSION }}
+          tag_name: ${{ env.VERSION }}
           body: ""
           generate_release_notes: false
-          files: target/release/mouse-injector-pcsx2-gui.exe
+          files: |
+            target/release/mouse-injector-pcsx2-gui.exe
+            PCSX2-Mouse-Injector-Installer.exe
