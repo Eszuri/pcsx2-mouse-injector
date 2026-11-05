@@ -19,7 +19,8 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, GA_ROOTOWNER,
+    EnumWindows, GetAncestor, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    IsIconic, IsWindowVisible, GA_ROOTOWNER,
 };
 
 const MEM_COMMIT: u32 = 0x1000;
@@ -30,6 +31,7 @@ pub struct Pcsx2Process {
     pub name: String,
     pub handle: HANDLE,
     pub ram_base: u64,
+    pub eemem_ptr_remote: u64,
     pub last_cpu_sample: std::time::Instant,
     pub last_cpu_time: u64,
     pub consecutive_idle_samples: u32,
@@ -150,6 +152,7 @@ impl Pcsx2Process {
                 name: target_name,
                 handle,
                 ram_base: 0,
+                eemem_ptr_remote: 0,
                 last_cpu_sample: std::time::Instant::now(),
                 last_cpu_time: initial_cpu,
                 consecutive_idle_samples: 0,
@@ -382,11 +385,12 @@ impl Pcsx2Process {
                         let sym = b"EEmem\0";
                         if let Some(proc_addr) = GetProcAddress(local_hmod, sym.as_ptr()) {
                             let rva = (proc_addr as usize) - (local_hmod as usize);
+                            let remote_ptr = ((h_mods[0] as usize) + rva) as u64;
                             let mut target_val: u64 = 0;
                             let mut bytes_read = 0usize;
                             if ReadProcessMemory(
                                 self.handle,
-                                ((h_mods[0] as usize) + rva) as *const c_void,
+                                remote_ptr as *const c_void,
                                 &mut target_val as *mut _ as *mut c_void,
                                 std::mem::size_of::<u64>(),
                                 &mut bytes_read,
@@ -394,6 +398,7 @@ impl Pcsx2Process {
                                 && target_val != 0
                             {
                                 FreeLibrary(local_hmod);
+                                self.eemem_ptr_remote = remote_ptr;
                                 self.ram_base = target_val;
                                 crate::log(&format!("PCSX2 >= 2.0 (EEmem export) attached at 0x{:X}", self.ram_base));
                                 return true;
@@ -467,6 +472,130 @@ impl Pcsx2Process {
         }
 
         false
+    }
+
+    pub fn is_eemem_valid(&mut self) -> bool {
+        if self.handle.is_null() || self.handle == INVALID_HANDLE_VALUE || self.ram_base == 0 {
+            return false;
+        }
+
+        if self.eemem_ptr_remote != 0 {
+            let mut target_val: u64 = 0;
+            let mut bytes_read = 0usize;
+            unsafe {
+                if ReadProcessMemory(
+                    self.handle,
+                    self.eemem_ptr_remote as *const c_void,
+                    &mut target_val as *mut _ as *mut c_void,
+                    std::mem::size_of::<u64>(),
+                    &mut bytes_read,
+                ) != 0
+                {
+                    if target_val == 0 {
+                        self.ram_base = 0;
+                        return false;
+                    }
+                    if target_val != self.ram_base {
+                        self.ram_base = target_val;
+                    }
+                } else {
+                    self.ram_base = 0;
+                    return false;
+                }
+            }
+        }
+
+        unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            if VirtualQueryEx(
+                self.handle,
+                self.ram_base as *const c_void,
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+            {
+                if info.State != MEM_COMMIT {
+                    self.ram_base = 0;
+                    return false;
+                }
+            } else {
+                self.ram_base = 0;
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub fn is_emulation_running(&self) -> bool {
+        if self.pid == 0 || self.handle.is_null() || self.handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+
+        struct WindowScanContext {
+            target_pid: u32,
+            has_running_game: bool,
+        }
+
+        unsafe extern "system" fn enum_windows_callback(
+            hwnd: windows_sys::Win32::Foundation::HWND,
+            lparam: windows_sys::Win32::Foundation::LPARAM,
+        ) -> windows_sys::Win32::Foundation::BOOL {
+            unsafe {
+                let ctx = &mut *(lparam as *mut WindowScanContext);
+                let mut win_pid = 0u32;
+                GetWindowThreadProcessId(hwnd, &mut win_pid);
+                if win_pid == ctx.target_pid {
+                    let is_vis = IsWindowVisible(hwnd) != 0 || IsIconic(hwnd) != 0;
+                    if is_vis {
+                        let mut buf = [0u16; 512];
+                        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+                        if len > 0 {
+                            let title = String::from_utf16_lossy(&buf[..len as usize]);
+                            let trimmed = title.trim();
+                            let lower = trimmed.to_lowercase();
+                            if !lower.is_empty()
+                                && lower != "_q_titlebar"
+                                && lower != "msctfime ui"
+                                && lower != "default ime"
+                            {
+                                if !lower.starts_with("pcsx2") {
+                                    ctx.has_running_game = true;
+                                    return 0;
+                                }
+                                if lower.contains("speed:")
+                                    || lower.contains("fps:")
+                                    || lower.contains("slus")
+                                    || lower.contains("sles")
+                                {
+                                    ctx.has_running_game = true;
+                                    return 0;
+                                }
+                                if lower.contains(" | ") && !lower.contains("game list") {
+                                    ctx.has_running_game = true;
+                                    return 0;
+                                }
+                            }
+                        }
+                    }
+                }
+                1
+            }
+        }
+
+        let mut ctx = WindowScanContext {
+            target_pid: self.pid,
+            has_running_game: false,
+        };
+
+        unsafe {
+            EnumWindows(
+                Some(enum_windows_callback),
+                &mut ctx as *mut WindowScanContext as windows_sys::Win32::Foundation::LPARAM,
+            );
+        }
+
+        ctx.has_running_game
     }
 
     pub fn memory(&self) -> Pcsx2Memory<'_> {

@@ -162,14 +162,31 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
             state.pcsx2_focused.store(is_focused, Ordering::Relaxed);
             state.pcsx2_paused.store(is_paused, Ordering::Relaxed);
 
-            if proc.ram_base == 0 && last_eemem_scan.elapsed() >= Duration::from_millis(1000) {
+            let emu_running = proc.is_emulation_running();
+            if !emu_running {
+                proc.ram_base = 0;
+                if active_game_idx.is_some() {
+                    crate::log("PCSX2 returned to game list / emulation stopped");
+                    active_game_idx = None;
+                    *state.active_game_name.write().unwrap() = None;
+                }
+            } else if proc.ram_base != 0 && !proc.is_eemem_valid() {
+                proc.ram_base = 0;
+                if active_game_idx.is_some() {
+                    crate::log("EEmem unmapped / invalidated");
+                    active_game_idx = None;
+                    *state.active_game_name.write().unwrap() = None;
+                }
+            }
+
+            if emu_running && proc.ram_base == 0 && last_eemem_scan.elapsed() >= Duration::from_millis(500) {
                 last_eemem_scan = Instant::now();
                 if proc.find_eemem_base() {
                     crate::log(&format!("EEmem base located at 0x{:X}", proc.ram_base));
                 }
             }
 
-            if proc.ram_base != 0 {
+            if emu_running && proc.ram_base != 0 {
                 let mem = proc.memory();
                 if let Some(idx) = active_game_idx
                     && !games[idx].detect(&mem)
