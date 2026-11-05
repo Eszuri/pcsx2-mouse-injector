@@ -29,3 +29,6 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+[build-dependencies]
+winres = "0.1"
+

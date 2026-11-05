@@ -131,12 +131,20 @@ fn main() -> eframe::Result<()> {
     spawn_injector_thread(shared_state.clone());
     log("spawn_injector_thread complete");
 
+    let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();
+
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([540.0, 580.0])
+        .with_min_inner_size([460.0, 480.0])
+        .with_resizable(true)
+        .with_title("PCSX2 Mouse Injector");
+
+    if let Some(icon) = icon_data {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([540.0, 580.0])
-            .with_min_inner_size([460.0, 480.0])
-            .with_resizable(true)
-            .with_title("PCSX2 Mouse Injector"),
+        viewport,
         ..Default::default()
     };
 
