@@ -70,28 +70,47 @@ impl GameDriver for BlackGame {
 
         let look_sensitivity = (sens as f32) / SENSITIVITY_DIVISOR;
 
-        let mut cam_x = mem.read_f32(BL_CAM_X);
+        let old_cam_x = mem.read_f32(BL_CAM_X);
+        let mut cam_x = old_cam_x;
         if cam_x.is_finite() {
             cam_x -= (dx as f32) * look_sensitivity;
+            while cam_x > 180.0 {
+                cam_x -= 360.0;
+            }
+            while cam_x < -180.0 {
+                cam_x += 360.0;
+            }
             if cam_x.is_finite() {
                 mem.write_f32(BL_CAM_X, cam_x);
             }
         }
 
-        let mut cam_y = mem.read_f32(BL_CAM_Y);
+        let old_cam_y = mem.read_f32(BL_CAM_Y);
+        let mut cam_y = old_cam_y;
         if cam_y.is_finite() {
             let eff_dy = if invert_pitch { -(dy as f32) } else { dy as f32 };
             cam_y += eff_dy * look_sensitivity * PITCH_RATIO_SCALE;
-            cam_y = cam_y.clamp(-1.55, 1.55);
+            cam_y = cam_y.clamp(-85.0, 85.0);
             if cam_y.is_finite() {
                 mem.write_f32(BL_CAM_Y, cam_y);
             }
         }
 
-        static LOG_INJECT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if LOG_INJECT_COUNT.load(std::sync::atomic::Ordering::Relaxed) < 5 {
-            LOG_INJECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::log(&format!("Black injected: dx={}, dy={}, camX={}, camY={}", dx, dy, cam_x, cam_y));
+        static LAST_CAM_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = LAST_CAM_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        let is_flick = dx.abs() > 40 || dy.abs() > 40;
+
+        if is_flick || now_ms.saturating_sub(last) >= 200 {
+            LAST_CAM_LOG.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+            let tag = if is_flick { "[CAMERA FLICK]" } else { "[CAMERA]" };
+            crate::log(&format!(
+                "{} dx={}, dy={} | CamX: {:.2} -> {:.2} (delta: {:.2}) | CamY: {:.2} -> {:.2} (delta: {:.2})",
+                tag, dx, dy, old_cam_x, cam_x, cam_x - old_cam_x, old_cam_y, cam_y, cam_y - old_cam_y
+            ));
         }
     }
 }

@@ -69,7 +69,8 @@ unsafe extern "system" fn raw_wnd_proc(
                     let mouse = &raw.data.mouse;
                     let last_x = mouse.lLastX;
                     let last_y = mouse.lLastY;
-                    if (last_x != 0 || last_y != 0)
+                    if (mouse.usFlags & 0x01) == 0
+                        && (last_x != 0 || last_y != 0)
                         && let Some(acc) = ACCUMULATOR.get()
                     {
                         acc.dx.fetch_add(last_x, Ordering::Relaxed);

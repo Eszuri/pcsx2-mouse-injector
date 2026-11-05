@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Media::timeBeginPeriod;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, SetCursorPos, SM_CXSCREEN,
-    SM_CYSCREEN,
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
+    SetCursorPos, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 use crate::config::InjectionMode;
@@ -24,6 +24,7 @@ pub struct SharedState {
     pub pcsx2_pid: AtomicU32,
     pub pcsx2_name: RwLock<String>,
     pub pcsx2_focused: AtomicBool,
+    pub pcsx2_paused: AtomicBool,
     pub active_game_name: RwLock<Option<String>>,
     pub is_injecting: AtomicBool,
 }
@@ -43,6 +44,7 @@ impl SharedState {
             pcsx2_pid: AtomicU32::new(0),
             pcsx2_name: RwLock::new(String::new()),
             pcsx2_focused: AtomicBool::new(false),
+            pcsx2_paused: AtomicBool::new(false),
             active_game_name: RwLock::new(None),
             is_injecting: AtomicBool::new(false),
         })
@@ -97,6 +99,7 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 state.pcsx2_pid.store(0, Ordering::Relaxed);
                 *state.pcsx2_name.write().unwrap() = String::new();
                 state.pcsx2_focused.store(false, Ordering::Relaxed);
+                state.pcsx2_paused.store(false, Ordering::Relaxed);
                 *state.active_game_name.write().unwrap() = None;
                 active_game_idx = None;
 
@@ -123,9 +126,39 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
 
             let proc = pcsx2.as_mut().unwrap();
 
-            // 3. Focus check
+            // Dynamic check: if user focused a different PCSX2 process, switch attachment immediately
+            unsafe {
+                let fg = GetForegroundWindow();
+                if !fg.is_null() {
+                    let mut fg_pid = 0u32;
+                    GetWindowThreadProcessId(fg, &mut fg_pid);
+                    let my_pid = windows_sys::Win32::System::Threading::GetCurrentProcessId();
+                    if fg_pid != 0
+                        && fg_pid != proc.pid
+                        && fg_pid != my_pid
+                        && let Some(fg_name) = crate::memory::get_process_name(fg_pid)
+                        && crate::memory::is_pcsx2_exe_name(&fg_name)
+                        && let Some(new_proc) = Pcsx2Process::attach_pid(fg_pid, fg_name)
+                    {
+                        crate::log(&format!(
+                            "Switched attachment to active PCSX2 window: {} (PID: {})",
+                            new_proc.name, new_proc.pid
+                        ));
+                        state.pcsx2_pid.store(new_proc.pid, Ordering::Relaxed);
+                        *state.pcsx2_name.write().unwrap() = new_proc.name.clone();
+                        *proc = new_proc;
+                        active_game_idx = None;
+                        *state.active_game_name.write().unwrap() = None;
+                        last_eemem_scan = Instant::now() - Duration::from_secs(10);
+                    }
+                }
+            }
+
+            // 3. Focus & Emulator Pause check
             let is_focused = proc.is_focused();
+            let is_paused = proc.update_pause_state();
             state.pcsx2_focused.store(is_focused, Ordering::Relaxed);
+            state.pcsx2_paused.store(is_paused, Ordering::Relaxed);
 
             // 4. EEmem check (throttled to 1000ms to avoid aggressive continuous memory scanning)
             if proc.ram_base == 0 && last_eemem_scan.elapsed() >= Duration::from_millis(1000) {
@@ -165,7 +198,7 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
             let mode = state.get_mode();
             let should_inject = match mode {
                 InjectionMode::Off => false,
-                InjectionMode::Auto => is_focused && active_game_idx.is_some(),
+                InjectionMode::Auto => is_focused && !is_paused && active_game_idx.is_some(),
             };
 
             if should_inject {
@@ -173,7 +206,7 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                     was_injecting = true;
                     state.is_injecting.store(true, Ordering::Relaxed);
                     accumulator.reset();
-                    crate::log("Injection ACTIVATED (should_inject = true)");
+                    crate::log("Injection ACTIVATED (PCSX2 in foreground and emulation active)");
 
                     // Center cursor inside PCSX2 window (supports multi-monitor setups)
                     unsafe {
@@ -203,27 +236,65 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 // Poll raw mouse delta from RAWINPUT
                 let (raw_dx, raw_dy) = accumulator.take();
 
-                // Also poll cursor position delta as fail-proof companion
+                // Poll cursor position delta and keep cursor centered
                 let mut cur = POINT { x: 0, y: 0 };
                 unsafe { GetCursorPos(&mut cur) };
                 let cur_dx = cur.x - lock_pos.x;
                 let cur_dy = cur.y - lock_pos.y;
 
-                // If cursor moved or on periodic interval, reset to center
-                if cur_dx != 0 || cur_dy != 0 || lock_counter.is_multiple_of(20) {
+                if cur_dx != 0 || cur_dy != 0 || lock_counter.is_multiple_of(10) {
                     unsafe { SetCursorPos(lock_pos.x, lock_pos.y) };
                 }
                 lock_counter = lock_counter.wrapping_add(1);
 
-                // Combine: prefer raw delta, fallback to cursor delta
-                let dx = if raw_dx != 0 { raw_dx } else { cur_dx };
-                let dy = if raw_dy != 0 { raw_dy } else { cur_dy };
+                // Filter out click-warp / teleport artifacts:
+                // When clicking (shooting/scoping), Windows or PCSX2 may report a normalized
+                // coordinate jump to ~32,768 (producing a delta ~31,920).
+                // Screen coordinates are always within physical display bounds (< 10,000).
+                let is_click_glitch = cur.x > 10_000
+                    || cur.y > 10_000
+                    || cur.x < -10_000
+                    || cur.y < -10_000
+                    || cur_dx.abs() > 5_000
+                    || cur_dy.abs() > 5_000;
 
-                if dx != 0 || dy != 0 {
-                    static LOG_DELTA_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if LOG_DELTA_COUNT.load(Ordering::Relaxed) < 10 {
-                        LOG_DELTA_COUNT.fetch_add(1, Ordering::Relaxed);
-                        crate::log(&format!("Input delta: dx={}, dy={} (raw: {},{}, cur: {},{})", dx, dy, raw_dx, raw_dy, cur_dx, cur_dy));
+                let valid_cur_dx = if is_click_glitch { 0 } else { cur_dx };
+                let valid_cur_dy = if is_click_glitch { 0 } else { cur_dy };
+
+                // Prefer raw delta if available, otherwise use validated cursor delta
+                let dx = if raw_dx != 0 && raw_dx.abs() <= 5_000 {
+                    raw_dx
+                } else {
+                    valid_cur_dx
+                };
+                let dy = if raw_dy != 0 && raw_dy.abs() <= 5_000 {
+                    raw_dy
+                } else {
+                    valid_cur_dy
+                };
+
+                if dx != 0 || dy != 0 || is_click_glitch || cur_dx.abs() > 30 || cur_dy.abs() > 30 {
+                    static LAST_INPUT_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last = LAST_INPUT_LOG.load(Ordering::Relaxed);
+                    let is_flick = dx.abs() > 40 || dy.abs() > 40 || cur_dx.abs() > 40 || cur_dy.abs() > 40 || is_click_glitch;
+
+                    if is_flick || now_ms.saturating_sub(last) >= 200 {
+                        LAST_INPUT_LOG.store(now_ms, Ordering::Relaxed);
+                        let tag = if is_click_glitch {
+                            "[CLICK GLITCH BLOCKED]"
+                        } else if is_flick {
+                            "[FAST/FLICK INPUT]"
+                        } else {
+                            "[INPUT]"
+                        };
+                        crate::log(&format!(
+                            "{} cur=({},{}) lock=({},{}) cur_delta=({},{}) raw=({},{}) -> applied=({},{})",
+                            tag, cur.x, cur.y, lock_pos.x, lock_pos.y, cur_dx, cur_dy, raw_dx, raw_dy, dx, dy
+                        ));
                     }
                 }
 
@@ -239,7 +310,16 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                     was_injecting = false;
                     state.is_injecting.store(false, Ordering::Relaxed);
                     accumulator.reset();
-                    crate::log("Injection DEACTIVATED (should_inject = false)");
+                    let reason = if is_paused {
+                        "PCSX2 emulator paused"
+                    } else if !is_focused {
+                        "PCSX2 lost focus"
+                    } else if active_game_idx.is_none() {
+                        "No supported game loaded"
+                    } else {
+                        "Injection mode disabled"
+                    };
+                    crate::log(&format!("Injection DEACTIVATED ({})", reason));
                 }
 
                 std::thread::sleep(Duration::from_millis(15));

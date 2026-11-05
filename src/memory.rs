@@ -1,6 +1,8 @@
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use windows_sys::Win32::Foundation::{CloseHandle, FreeLibrary, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, FreeLibrary, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -13,10 +15,12 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::ProcessStatus::{EnumProcessModules, GetModuleFileNameExA};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-    PROCESS_VM_READ, PROCESS_VM_WRITE,
+    GetCurrentProcessId, GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION,
+    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetAncestor, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, GA_ROOTOWNER,
+};
 
 const MEM_COMMIT: u32 = 0x1000;
 const PS2_MAX_MEM_ADDR: u64 = 0x0800_0000; // 128 MB maximum supported RAM range
@@ -26,6 +30,10 @@ pub struct Pcsx2Process {
     pub name: String,
     pub handle: HANDLE,
     pub ram_base: u64,
+    pub last_cpu_sample: std::time::Instant,
+    pub last_cpu_time: u64,
+    pub consecutive_idle_samples: u32,
+    pub is_paused: bool,
 }
 
 unsafe impl Send for Pcsx2Process {}
@@ -48,11 +56,133 @@ pub struct Pcsx2Memory<'a> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl Pcsx2Process {
-    pub fn find_and_attach() -> Option<Self> {
-        unsafe {
-            let my_pid = GetCurrentProcessId();
+pub fn is_pcsx2_exe_name(name: &str) -> bool {
+    let clean = name
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-' && c != '_')
+        .to_lowercase();
+    let is_not_injector = !clean.contains("injector");
+    let is_pcsx2 = clean == "pcsx2.exe"
+        || clean == "pcsx2-qt.exe"
+        || clean == "pcsx2-wx.exe"
+        || clean == "pcsx2x64.exe"
+        || clean == "pcsx2-avx2.exe"
+        || clean == "pcsx2-sse4.exe"
+        || (clean.contains("pcsx2") && clean.contains(".exe"));
+    is_not_injector && is_pcsx2
+}
 
+pub fn get_process_name(pid: u32) -> Option<String> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        let handle = if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            OpenProcess(0x1000, 0, pid) // PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        } else {
+            handle
+        };
+
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        let mut buf = [0u8; 512];
+        let len = GetModuleFileNameExA(handle, null_mut(), buf.as_mut_ptr(), buf.len() as u32);
+        CloseHandle(handle);
+
+        if len > 0 {
+            let path_str = String::from_utf8_lossy(&buf[..len as usize]);
+            let name = std::path::Path::new(path_str.as_ref())
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let clean = name
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-' && c != '_')
+                .to_string();
+            if !clean.is_empty() {
+                Some(clean)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+fn get_process_cpu_time(handle: HANDLE) -> u64 {
+    unsafe {
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+
+        if GetProcessTimes(
+            handle,
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) != 0 {
+            let k = ((kernel.dwHighDateTime as u64) << 32) | (kernel.dwLowDateTime as u64);
+            let u = ((user.dwHighDateTime as u64) << 32) | (user.dwLowDateTime as u64);
+            k.saturating_add(u)
+        } else {
+            0
+        }
+    }
+}
+
+impl Pcsx2Process {
+    pub fn attach_pid(target_pid: u32, target_name: String) -> Option<Self> {
+        unsafe {
+            let desired_access = PROCESS_VM_OPERATION
+                | PROCESS_VM_READ
+                | PROCESS_VM_WRITE
+                | PROCESS_QUERY_INFORMATION;
+
+            let handle = OpenProcess(desired_access, 0, target_pid);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                return None;
+            }
+
+            let initial_cpu = get_process_cpu_time(handle);
+            let mut proc = Self {
+                pid: target_pid,
+                name: target_name,
+                handle,
+                ram_base: 0,
+                last_cpu_sample: std::time::Instant::now(),
+                last_cpu_time: initial_cpu,
+                consecutive_idle_samples: 0,
+                is_paused: false,
+            };
+
+            proc.find_eemem_base();
+            Some(proc)
+        }
+    }
+
+    pub fn find_and_attach() -> Option<Self> {
+        let my_pid = unsafe { GetCurrentProcessId() };
+
+        // 1. If foreground window belongs to a PCSX2 process, attach to it immediately!
+        unsafe {
+            let fg = GetForegroundWindow();
+            if !fg.is_null() {
+                let mut fg_pid = 0u32;
+                GetWindowThreadProcessId(fg, &mut fg_pid);
+                if fg_pid != 0
+                    && fg_pid != my_pid
+                    && let Some(name) = get_process_name(fg_pid)
+                    && is_pcsx2_exe_name(&name)
+                    && let Some(proc) = Self::attach_pid(fg_pid, name)
+                {
+                    return Some(proc);
+                }
+            }
+        }
+
+        // 2. Otherwise scan process snapshot and prefer pcsx2-qt over older/idle pcsx2
+        unsafe {
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snapshot == INVALID_HANDLE_VALUE {
                 return None;
@@ -66,11 +196,9 @@ impl Pcsx2Process {
                 return None;
             }
 
-            let mut target_pid = 0u32;
-            let mut target_name = String::new();
+            let mut candidates: Vec<(u32, String)> = Vec::new();
 
             loop {
-                // Must not match our own process!
                 if entry.th32ProcessID != my_pid {
                     let null_pos = entry
                         .szExeFile
@@ -79,22 +207,9 @@ impl Pcsx2Process {
                         .unwrap_or(entry.szExeFile.len());
                     let exe_name = String::from_utf16_lossy(&entry.szExeFile[..null_pos]);
                     let clean_name = exe_name.trim().to_string();
-                    let lower = clean_name.to_lowercase();
 
-                    // Filter out any mouse-injector executable and match actual PCSX2 emulator
-                    let is_not_injector = !lower.contains("injector");
-                    let is_pcsx2 = lower == "pcsx2.exe"
-                        || lower == "pcsx2-qt.exe"
-                        || lower == "pcsx2-wx.exe"
-                        || lower == "pcsx2x64.exe"
-                        || lower == "pcsx2-avx2.exe"
-                        || lower == "pcsx2-sse4.exe"
-                        || (lower.contains("pcsx2") && lower.contains(".exe"));
-
-                    if is_not_injector && is_pcsx2 {
-                        target_pid = entry.th32ProcessID;
-                        target_name = clean_name;
-                        break;
+                    if is_pcsx2_exe_name(&clean_name) {
+                        candidates.push((entry.th32ProcessID, clean_name));
                     }
                 }
 
@@ -102,33 +217,23 @@ impl Pcsx2Process {
                     break;
                 }
             }
-
             CloseHandle(snapshot);
 
-            if target_pid == 0 {
-                return None;
+            // Prefer pcsx2-qt over generic pcsx2, or higher PID
+            candidates.sort_by(|a, b| {
+                let a_is_qt = a.1.to_lowercase().contains("-qt");
+                let b_is_qt = b.1.to_lowercase().contains("-qt");
+                b_is_qt.cmp(&a_is_qt).then_with(|| b.0.cmp(&a.0))
+            });
+
+            for (pid, name) in candidates {
+                if let Some(proc) = Self::attach_pid(pid, name) {
+                    return Some(proc);
+                }
             }
-
-            let desired_access = PROCESS_VM_OPERATION
-                | PROCESS_VM_READ
-                | PROCESS_VM_WRITE
-                | PROCESS_QUERY_INFORMATION;
-
-            let handle = OpenProcess(desired_access, 0, target_pid);
-            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-                return None;
-            }
-
-            let mut proc = Self {
-                pid: target_pid,
-                name: target_name,
-                handle,
-                ram_base: 0,
-            };
-
-            proc.find_eemem_base();
-            Some(proc)
         }
+
+        None
     }
 
     pub fn is_still_alive(&self) -> bool {
@@ -155,6 +260,115 @@ impl Pcsx2Process {
             GetWindowThreadProcessId(fg, &mut fg_pid);
             fg_pid == self.pid
         }
+    }
+
+    /// Checks if the PCSX2 emulator itself is paused (via Space/Esc/Pause hotkey, PCSX2 menu, or focus loss).
+    /// Uses dual detection:
+    /// - Window title caption inspection (for versions that update title text)
+    /// - CPU Execution Heartbeat (emulation thread sleep detection via GetProcessTimes)
+    ///
+    /// Does NOT trigger on in-game pause menus (which continue emulating and consuming CPU at 60 FPS).
+    pub fn update_pause_state(&mut self) -> bool {
+        if self.pid == 0 || self.handle.is_null() || self.handle == INVALID_HANDLE_VALUE {
+            self.is_paused = false;
+            return false;
+        }
+
+        // 1. Direct window title check (instant match for PCSX2 versions that update window caption)
+        let title_paused = unsafe {
+            let fg = GetForegroundWindow();
+            if !fg.is_null() {
+                let mut fg_pid = 0u32;
+                GetWindowThreadProcessId(fg, &mut fg_pid);
+                if fg_pid == self.pid {
+                    let check_title = |hwnd: windows_sys::Win32::Foundation::HWND| -> bool {
+                        let mut buf = [0u16; 512];
+                        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+                        if len > 0 {
+                            let title = String::from_utf16_lossy(&buf[..len as usize]);
+                            let lower = title.to_lowercase();
+                            if lower.contains("paused")
+                                || lower.contains("speed: 0%")
+                                || lower.contains("fps: 0.00")
+                                || lower.contains("fps: 0.0")
+                            {
+                                return true;
+                            }
+                        }
+                        false
+                    };
+
+                    if check_title(fg) {
+                        true
+                    } else {
+                        let root = GetAncestor(fg, GA_ROOTOWNER);
+                        !root.is_null() && root != fg && check_title(root)
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if title_paused {
+            self.is_paused = true;
+            self.consecutive_idle_samples = 2;
+            return true;
+        }
+
+        // 2. CPU Execution Heartbeat check
+        // In PCSX2, the Emotion Engine and GS threads run at 100% core load while emulating,
+        // consuming tens or hundreds of milliseconds of CPU time per 80ms window.
+        // When PCSX2 itself is paused (Space, Esc, Pause Menu, etc.), the emulation threads
+        // sleep on a condition variable, so CPU time delta drops to virtually ZERO.
+        // In-game pause menus continue emulating at 60 FPS, so CPU delta remains high.
+        let elapsed = self.last_cpu_sample.elapsed();
+        if elapsed >= std::time::Duration::from_millis(250) {
+            self.last_cpu_sample = std::time::Instant::now();
+            let cur_cpu = get_process_cpu_time(self.handle);
+            let cpu_delta = cur_cpu.saturating_sub(self.last_cpu_time);
+            self.last_cpu_time = cur_cpu;
+
+            // Convert elapsed duration to 100ns units (same units as GetProcessTimes)
+            let elapsed_units = (elapsed.as_nanos() / 100) as u64;
+
+            // In 250ms:
+            // - Active emulation (EE + GS threads) consumes > 3,000,000 units (~300ms+ CPU time across cores).
+            // - Paused emulation (EmuThread sleeping, only Qt GUI idling) consumes < 200,000 units (<20ms).
+            // Threshold = 500,000 units (~50ms of CPU time / ~20% of one core).
+            const IDLE_CPU_THRESHOLD: u64 = 500_000;
+            let is_idle = cpu_delta < IDLE_CPU_THRESHOLD;
+
+            let was_paused = self.is_paused;
+            if is_idle {
+                self.consecutive_idle_samples = self.consecutive_idle_samples.saturating_add(1);
+                if self.consecutive_idle_samples >= 2 {
+                    self.is_paused = true;
+                }
+            } else {
+                self.consecutive_idle_samples = 0;
+                self.is_paused = false;
+            }
+
+            if self.is_paused != was_paused {
+                let cpu_pct = if elapsed_units > 0 {
+                    (cpu_delta as f64 / elapsed_units as f64) * 100.0
+                } else {
+                    0.0
+                };
+                crate::log(&format!(
+                    "PCSX2 pause state changed: is_paused = {} (CPU load: {:.1}%, delta: {} units / ~{:.1}ms)",
+                    self.is_paused,
+                    cpu_pct,
+                    cpu_delta,
+                    (cpu_delta as f64) / 10_000.0
+                ));
+            }
+        }
+
+        self.is_paused
     }
 
     pub fn find_eemem_base(&mut self) -> bool {
