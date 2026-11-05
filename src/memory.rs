@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const MEM_COMMIT: u32 = 0x1000;
-const PS2_MAX_MEM_ADDR: u64 = 0x0800_0000; // 128 MB maximum supported RAM range
+const PS2_MAX_MEM_ADDR: u64 = 0x0800_0000;
 
 pub struct Pcsx2Process {
     pub pid: u32,
@@ -75,7 +75,7 @@ pub fn get_process_name(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
         let handle = if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            OpenProcess(0x1000, 0, pid) // PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            OpenProcess(0x1000, 0, pid)
         } else {
             handle
         };
@@ -164,7 +164,6 @@ impl Pcsx2Process {
     pub fn find_and_attach() -> Option<Self> {
         let my_pid = unsafe { GetCurrentProcessId() };
 
-        // 1. If foreground window belongs to a PCSX2 process, attach to it immediately!
         unsafe {
             let fg = GetForegroundWindow();
             if !fg.is_null() {
@@ -181,7 +180,6 @@ impl Pcsx2Process {
             }
         }
 
-        // 2. Otherwise scan process snapshot and prefer pcsx2-qt over older/idle pcsx2
         unsafe {
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snapshot == INVALID_HANDLE_VALUE {
@@ -219,7 +217,6 @@ impl Pcsx2Process {
             }
             CloseHandle(snapshot);
 
-            // Prefer pcsx2-qt over generic pcsx2, or higher PID
             candidates.sort_by(|a, b| {
                 let a_is_qt = a.1.to_lowercase().contains("-qt");
                 let b_is_qt = b.1.to_lowercase().contains("-qt");
@@ -243,7 +240,7 @@ impl Pcsx2Process {
         let mut exit_code = 0u32;
         unsafe {
             windows_sys::Win32::System::Threading::GetExitCodeProcess(self.handle, &mut exit_code) != 0
-                && exit_code == 259 // STILL_ACTIVE = 259
+                && exit_code == 259
         }
     }
 
@@ -262,19 +259,12 @@ impl Pcsx2Process {
         }
     }
 
-    /// Checks if the PCSX2 emulator itself is paused (via Space/Esc/Pause hotkey, PCSX2 menu, or focus loss).
-    /// Uses dual detection:
-    /// - Window title caption inspection (for versions that update title text)
-    /// - CPU Execution Heartbeat (emulation thread sleep detection via GetProcessTimes)
-    ///
-    /// Does NOT trigger on in-game pause menus (which continue emulating and consuming CPU at 60 FPS).
     pub fn update_pause_state(&mut self) -> bool {
         if self.pid == 0 || self.handle.is_null() || self.handle == INVALID_HANDLE_VALUE {
             self.is_paused = false;
             return false;
         }
 
-        // 1. Direct window title check (instant match for PCSX2 versions that update window caption)
         let title_paused = unsafe {
             let fg = GetForegroundWindow();
             if !fg.is_null() {
@@ -318,12 +308,6 @@ impl Pcsx2Process {
             return true;
         }
 
-        // 2. CPU Execution Heartbeat check
-        // In PCSX2, the Emotion Engine and GS threads run at 100% core load while emulating,
-        // consuming tens or hundreds of milliseconds of CPU time per 80ms window.
-        // When PCSX2 itself is paused (Space, Esc, Pause Menu, etc.), the emulation threads
-        // sleep on a condition variable, so CPU time delta drops to virtually ZERO.
-        // In-game pause menus continue emulating at 60 FPS, so CPU delta remains high.
         let elapsed = self.last_cpu_sample.elapsed();
         if elapsed >= std::time::Duration::from_millis(250) {
             self.last_cpu_sample = std::time::Instant::now();
@@ -331,13 +315,8 @@ impl Pcsx2Process {
             let cpu_delta = cur_cpu.saturating_sub(self.last_cpu_time);
             self.last_cpu_time = cur_cpu;
 
-            // Convert elapsed duration to 100ns units (same units as GetProcessTimes)
             let elapsed_units = (elapsed.as_nanos() / 100) as u64;
 
-            // In 250ms:
-            // - Active emulation (EE + GS threads) consumes > 3,000,000 units (~300ms+ CPU time across cores).
-            // - Paused emulation (EmuThread sleeping, only Qt GUI idling) consumes < 200,000 units (<20ms).
-            // Threshold = 500,000 units (~50ms of CPU time / ~20% of one core).
             const IDLE_CPU_THRESHOLD: u64 = 500_000;
             let is_idle = cpu_delta < IDLE_CPU_THRESHOLD;
 
@@ -377,9 +356,7 @@ impl Pcsx2Process {
         }
 
         unsafe {
-            // =========================================================================
-            // Strategy 1: Dynamic lookup of exported "EEmem" symbol (PCSX2 2.0+ / 64-bit Qt)
-            // =========================================================================
+
             let mut h_mods = [null_mut(); 1024];
             let mut cb_needed = 0u32;
             let ptr_size = std::mem::size_of::<*mut c_void>() as u32;
@@ -427,10 +404,6 @@ impl Pcsx2Process {
                 }
             }
 
-            // =========================================================================
-            // Strategy 2: Direct 0x20000000 check for PCSX2 1.x (1.6.0, 1.4.0, etc. 32-bit)
-            // In PCSX2 1.6.0, EE RAM is permanently mapped at virtual address 0x20000000.
-            // =========================================================================
             let test_addr: usize = 0x2000_0000;
             let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             if VirtualQueryEx(
@@ -462,9 +435,6 @@ impl Pcsx2Process {
                 }
             }
 
-            // =========================================================================
-            // Strategy 3: Heuristic scan for 32MB / 64MB / 128MB mapped region or 0x20000000 alloc
-            // =========================================================================
             let mut scan_ptr: usize = 0;
             while VirtualQueryEx(
                 self.handle,

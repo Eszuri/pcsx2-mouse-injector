@@ -50,23 +50,26 @@ unsafe extern "system" fn raw_wnd_proc(
     const WM_INPUT: u32 = 0x00FF;
 
     if msg == WM_INPUT {
-        let mut buf = [0u8; 128];
-        let mut size = buf.len() as u32;
+        #[repr(C, align(8))]
+        struct RawInputBuf {
+            raw: RAWINPUT,
+            extra: [u8; 64],
+        }
+        let mut buf: RawInputBuf = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<RawInputBuf>() as u32;
         let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
 
         unsafe {
             let res = GetRawInputData(
                 lparam as HRAWINPUT,
                 RID_INPUT,
-                buf.as_mut_ptr() as *mut c_void,
+                &mut buf as *mut _ as *mut c_void,
                 &mut size,
                 header_size,
             );
 
-            if res != u32::MAX && res > 0 {
-                let raw = &*(buf.as_ptr() as *const RAWINPUT);
-                if raw.header.dwType == 0 {
-                    let mouse = &raw.data.mouse;
+            if res != u32::MAX && res > 0 && buf.raw.header.dwType == 0 {
+                    let mouse = &buf.raw.data.mouse;
                     let last_x = mouse.lLastX;
                     let last_y = mouse.lLastY;
                     if (mouse.usFlags & 0x01) == 0
@@ -76,8 +79,8 @@ unsafe extern "system" fn raw_wnd_proc(
                         acc.dx.fetch_add(last_x, Ordering::Relaxed);
                         acc.dy.fetch_add(last_y, Ordering::Relaxed);
                     }
-                }
             }
+            DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         return 0;
     }
@@ -101,7 +104,6 @@ pub fn start_raw_input_listener(acc: Arc<RawMouseAccumulator>) -> std::thread::J
         let atom = RegisterClassExW(&wc);
         crate::log(&format!("TopLevel RegisterClassExW atom: {}", atom));
 
-        // Create top-level popup window (NULL parent) so RIDEV_INPUTSINK works properly
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
@@ -111,7 +113,7 @@ pub fn start_raw_input_listener(acc: Arc<RawMouseAccumulator>) -> std::thread::J
             0,
             0,
             0,
-            null_mut(), // Top-level window!
+            null_mut(),
             null_mut(),
             instance,
             null_mut(),
@@ -124,8 +126,8 @@ pub fn start_raw_input_listener(acc: Arc<RawMouseAccumulator>) -> std::thread::J
         }
 
         let rid = RAWINPUTDEVICE {
-            usUsagePage: 0x01, // Generic Desktop
-            usUsage: 0x02,     // Mouse
+            usUsagePage: 0x01,
+            usUsage: 0x02,
             dwFlags: RIDEV_INPUTSINK,
             hwndTarget: hwnd,
         };

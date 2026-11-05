@@ -13,12 +13,15 @@ use injector::{spawn_injector_thread, SharedState};
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+use windows_sys::Win32::UI::WindowsAndMessaging::{ClipCursor, FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
 
 struct SingleInstanceGuard(HANDLE);
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
+        unsafe {
+            ClipCursor(std::ptr::null());
+        }
         if !self.0.is_null() {
             unsafe { CloseHandle(self.0) };
         }
@@ -69,7 +72,7 @@ fn get_app_dir() -> std::path::PathBuf {
 }
 
 fn get_config_path() -> String {
-    // Portable mode: if mouseinjector.json already exists next to exe, respect it
+
     if let Ok(mut exe_dir) = std::env::current_exe() {
         exe_dir.set_file_name("mouseinjector.json");
         if exe_dir.exists() {
@@ -77,7 +80,6 @@ fn get_config_path() -> String {
         }
     }
 
-    // Default secure location: %LOCALAPPDATA%\PCSX2MouseInjector\mouseinjector.json
     let cfg_path = get_app_dir().join("mouseinjector.json");
     cfg_path.to_string_lossy().to_string()
 }
@@ -88,7 +90,6 @@ use std::io::Write;
 pub fn log(msg: &str) {
     let log_path = get_app_dir().join("injector_run.log");
 
-    // Log rotation: cap at 512 KB to prevent unbounded disk growth
     if let Ok(meta) = std::fs::metadata(&log_path)
         && meta.len() > 512 * 1024
     {
@@ -116,7 +117,7 @@ fn main() -> eframe::Result<()> {
     let _single_instance_guard = match check_single_instance() {
         Ok(guard) => guard,
         Err(()) => {
-            // Duplicate instance detected and terminated cleanly
+
             return Ok(());
         }
     };

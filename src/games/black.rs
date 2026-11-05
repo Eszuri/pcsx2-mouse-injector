@@ -11,7 +11,7 @@ const PITCH_RATIO_SCALE: f32 = 4.0 / 3.0;
 fn check_serial(mem: &Pcsx2Memory, addr: u32) -> bool {
     let mut buf = [0u8; 12];
     if mem.read_bytes(addr, &mut buf) {
-        // Check ASCII bytes directly
+
         if buf.starts_with(b"SLUS_213.76") || buf.starts_with(b"SLUS-21376") {
             return true;
         }
@@ -24,12 +24,10 @@ fn check_serial(mem: &Pcsx2Memory, addr: u32) -> bool {
     let w1 = mem.read_word_swapped(addr + 4);
     let w2 = mem.read_word_swapped(addr + 8);
 
-    // USA: SLUS_213.76;
     if w0 == 0x534C5553 && w1 == 0x5F323133 && (w2 == 0x2E37363B || (w2 & 0xFFFF_FF00) == 0x2E373600) {
         return true;
     }
 
-    // PAL: SLES_538.86;
     if w0 == 0x534C4553 && w1 == 0x5F353338 && (w2 == 0x2E38363B || (w2 & 0xFFFF_FF00) == 0x2E383600) {
         return true;
     }
@@ -74,12 +72,6 @@ impl GameDriver for BlackGame {
         let mut cam_x = old_cam_x;
         if cam_x.is_finite() {
             cam_x -= (dx as f32) * look_sensitivity;
-            while cam_x > 180.0 {
-                cam_x -= 360.0;
-            }
-            while cam_x < -180.0 {
-                cam_x += 360.0;
-            }
             if cam_x.is_finite() {
                 mem.write_f32(BL_CAM_X, cam_x);
             }

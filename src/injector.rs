@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Media::timeBeginPeriod;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
+    ClipCursor, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
     SetCursorPos, SM_CXSCREEN, SM_CYSCREEN,
 };
 
@@ -14,12 +14,11 @@ use crate::memory::Pcsx2Process;
 use crate::raw_input::{start_raw_input_listener, RawMouseAccumulator};
 
 pub struct SharedState {
-    // User Settings
-    pub mode: AtomicU32,          // 0: Off, 1: On, 2: Auto
-    pub sensitivity: AtomicU32,   // 1 .. 200 (20 = 100%)
-    pub invert_pitch: AtomicBool, // true / false
 
-    // Real-time Status
+    pub mode: AtomicU32,
+    pub sensitivity: AtomicU32,
+    pub invert_pitch: AtomicBool,
+
     pub pcsx2_connected: AtomicBool,
     pub pcsx2_pid: AtomicU32,
     pub pcsx2_name: RwLock<String>,
@@ -82,9 +81,11 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
         let mut lock_pos = POINT { x: 0, y: 0 };
         let mut was_injecting = false;
         let mut lock_counter: u32 = 0;
+        let mut prev_cur_dx: i32 = 0;
+        let mut prev_cur_dy: i32 = 0;
 
         loop {
-            // Process check / attachment
+
             let mut proc_alive = false;
             if let Some(ref mut proc) = pcsx2 {
                 if proc.is_still_alive() {
@@ -116,6 +117,9 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
 
                 if was_injecting {
                     was_injecting = false;
+                    unsafe { ClipCursor(std::ptr::null()) };
+                    prev_cur_dx = 0;
+                    prev_cur_dy = 0;
                     state.is_injecting.store(false, Ordering::Relaxed);
                     accumulator.reset();
                 }
@@ -126,7 +130,6 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
 
             let proc = pcsx2.as_mut().unwrap();
 
-            // Dynamic check: if user focused a different PCSX2 process, switch attachment immediately
             unsafe {
                 let fg = GetForegroundWindow();
                 if !fg.is_null() {
@@ -154,13 +157,11 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 }
             }
 
-            // 3. Focus & Emulator Pause check
             let is_focused = proc.is_focused();
             let is_paused = proc.update_pause_state();
             state.pcsx2_focused.store(is_focused, Ordering::Relaxed);
             state.pcsx2_paused.store(is_paused, Ordering::Relaxed);
 
-            // 4. EEmem check (throttled to 1000ms to avoid aggressive continuous memory scanning)
             if proc.ram_base == 0 && last_eemem_scan.elapsed() >= Duration::from_millis(1000) {
                 last_eemem_scan = Instant::now();
                 if proc.find_eemem_base() {
@@ -168,7 +169,6 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 }
             }
 
-            // 5. Game detection (if RAM base is known)
             if proc.ram_base != 0 {
                 let mem = proc.memory();
                 if let Some(idx) = active_game_idx
@@ -194,7 +194,6 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 *state.active_game_name.write().unwrap() = None;
             }
 
-            // 6. Injection State Decision
             let mode = state.get_mode();
             let should_inject = match mode {
                 InjectionMode::Off => false,
@@ -208,7 +207,6 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                     accumulator.reset();
                     crate::log("Injection ACTIVATED (PCSX2 in foreground and emulation active)");
 
-                    // Center cursor inside PCSX2 window (supports multi-monitor setups)
                     unsafe {
                         let fg = GetForegroundWindow();
                         let mut rect: RECT = std::mem::zeroed();
@@ -217,6 +215,7 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                                 x: (rect.left + rect.right) / 2,
                                 y: (rect.top + rect.bottom) / 2,
                             };
+                            ClipCursor(&rect);
                         } else {
                             let screen_w = GetSystemMetrics(SM_CXSCREEN);
                             let screen_h = GetSystemMetrics(SM_CYSCREEN);
@@ -233,10 +232,8 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 let game = &games[game_idx];
                 let tickrate = game.tickrate_ms();
 
-                // Poll raw mouse delta from RAWINPUT
                 let (raw_dx, raw_dy) = accumulator.take();
 
-                // Poll cursor position delta and keep cursor centered
                 let mut cur = POINT { x: 0, y: 0 };
                 unsafe { GetCursorPos(&mut cur) };
                 let cur_dx = cur.x - lock_pos.x;
@@ -247,27 +244,33 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 }
                 lock_counter = lock_counter.wrapping_add(1);
 
-                // Filter out click-warp / teleport artifacts:
-                // When clicking (shooting/scoping), Windows or PCSX2 may report a normalized
-                // coordinate jump to ~32,768 (producing a delta ~31,920).
-                // Screen coordinates are always within physical display bounds (< 10,000).
                 let is_click_glitch = cur.x > 10_000
                     || cur.y > 10_000
                     || cur.x < -10_000
                     || cur.y < -10_000
-                    || cur_dx.abs() > 5_000
-                    || cur_dy.abs() > 5_000;
+                    || cur_dx.abs() > 500
+                    || cur_dy.abs() > 350
+                    || (prev_cur_dx.abs() < 20 && cur_dx.abs() > 250)
+                    || (prev_cur_dy.abs() < 20 && cur_dy.abs() > 180);
 
                 let valid_cur_dx = if is_click_glitch { 0 } else { cur_dx };
                 let valid_cur_dy = if is_click_glitch { 0 } else { cur_dy };
 
-                // Prefer raw delta if available, otherwise use validated cursor delta
-                let dx = if raw_dx != 0 && raw_dx.abs() <= 5_000 {
+                if is_click_glitch {
+                    prev_cur_dx = 0;
+                    prev_cur_dy = 0;
+                    unsafe { SetCursorPos(lock_pos.x, lock_pos.y) };
+                } else {
+                    prev_cur_dx = valid_cur_dx;
+                    prev_cur_dy = valid_cur_dy;
+                }
+
+                let dx = if raw_dx != 0 && raw_dx.abs() <= 500 {
                     raw_dx
                 } else {
                     valid_cur_dx
                 };
-                let dy = if raw_dy != 0 && raw_dy.abs() <= 5_000 {
+                let dy = if raw_dy != 0 && raw_dy.abs() <= 350 {
                     raw_dy
                 } else {
                     valid_cur_dy
@@ -308,6 +311,9 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
             } else {
                 if was_injecting {
                     was_injecting = false;
+                    unsafe { ClipCursor(std::ptr::null()) };
+                    prev_cur_dx = 0;
+                    prev_cur_dy = 0;
                     state.is_injecting.store(false, Ordering::Relaxed);
                     accumulator.reset();
                     let reason = if is_paused {

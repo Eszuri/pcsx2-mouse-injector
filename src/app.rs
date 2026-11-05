@@ -74,7 +74,6 @@ impl eframe::App for MouseInjectorApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
-            // Title Header
             ui.vertical_centered(|ui| {
                 ui.add_space(2.0);
                 ui.heading(
@@ -87,12 +86,10 @@ impl eframe::App for MouseInjectorApp {
 
             ui.add_space(2.0);
 
-            // Navigation Bar
             self.render_navbar(ui);
 
             ui.separator();
 
-            // Tab Content
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -157,7 +154,6 @@ impl MouseInjectorApp {
         let game_name = self.state.active_game_name.read().unwrap().clone();
         let mode = self.state.get_mode();
 
-        // Status Dashboard Card
         egui::Frame::none()
             .fill(Color32::from_rgb(24, 28, 36))
             .stroke(Stroke::new(1.0, Color32::from_rgb(42, 48, 60)))
@@ -174,7 +170,6 @@ impl MouseInjectorApp {
                 );
                 ui.add_space(4.0);
 
-                // Emulator row
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Emulator:").size(13.0).color(Color32::LIGHT_GRAY));
                     if connected {
@@ -185,7 +180,6 @@ impl MouseInjectorApp {
                     }
                 });
 
-                // Focus row
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Window Focus:").size(13.0).color(Color32::LIGHT_GRAY));
                     if connected {
@@ -199,7 +193,6 @@ impl MouseInjectorApp {
                     }
                 });
 
-                // Game row
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Game Detected:").size(13.0).color(Color32::LIGHT_GRAY));
                     if let Some(game) = game_name {
@@ -211,7 +204,6 @@ impl MouseInjectorApp {
                     }
                 });
 
-                // Config File row
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Config File:").size(13.0).color(Color32::LIGHT_GRAY));
                     let avail_w = ui.available_width().max(60.0);
@@ -230,7 +222,6 @@ impl MouseInjectorApp {
 
         ui.add_space(4.0);
 
-        // Mode Selector
         ui.label(
             RichText::new("INJECTION MODE")
                 .font(FontId::proportional(11.0))
@@ -278,11 +269,9 @@ impl MouseInjectorApp {
             }
         });
 
-        // Mode hint
         ui.add_space(6.0);
         ui.separator();
 
-        // Settings Section
         ui.label(
             RichText::new("SETTINGS")
                 .font(FontId::proportional(11.0))
@@ -290,7 +279,6 @@ impl MouseInjectorApp {
                 .strong(),
         );
 
-        // Sensitivity row
         let mut sens = self.state.sensitivity.load(Ordering::Relaxed);
         let pct = sens * 5;
         ui.label(RichText::new(format!("Sensitivity: {}%", pct)).size(13.0));
@@ -325,7 +313,6 @@ impl MouseInjectorApp {
 
         ui.add_space(2.0);
 
-        // Invert Pitch Checkbox
         let mut invert = self.state.invert_pitch.load(Ordering::Relaxed);
         if ui.checkbox(&mut invert, "Invert Vertical Look (Pitch)").changed() {
             self.state.invert_pitch.store(invert, Ordering::Relaxed);
@@ -348,7 +335,6 @@ impl MouseInjectorApp {
 
         ui.add_space(8.0);
 
-        // Black Card
         egui::Frame::none()
             .fill(Color32::from_rgb(22, 26, 34))
             .stroke(Stroke::new(1.0, Color32::from_rgb(45, 110, 75)))
@@ -402,7 +388,6 @@ impl MouseInjectorApp {
 
         ui.add_space(12.0);
 
-        // Coming soon note
         egui::Frame::none()
             .fill(Color32::from_rgb(26, 30, 38))
             .stroke(Stroke::new(1.0, Color32::from_rgb(45, 52, 65)))
