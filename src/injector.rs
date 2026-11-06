@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Media::timeBeginPeriod;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ClipCursor, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
-    SetCursorPos, SM_CXSCREEN, SM_CYSCREEN,
+    ClipCursor, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
+    GetWindowThreadProcessId, SetCursorPos, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 use crate::config::InjectionMode;
@@ -14,7 +14,6 @@ use crate::memory::Pcsx2Process;
 use crate::raw_input::{start_raw_input_listener, RawMouseAccumulator};
 
 pub struct SharedState {
-
     pub mode: AtomicU32,
     pub sensitivity: AtomicU32,
     pub invert_pitch: AtomicBool,
@@ -79,13 +78,12 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
         let mut active_game_idx: Option<usize> = None;
 
         let mut lock_pos = POINT { x: 0, y: 0 };
+        let mut last_cur = POINT { x: 0, y: 0 };
+        let mut suppress_cursor_frames: u32 = 0;
         let mut was_injecting = false;
         let mut lock_counter: u32 = 0;
-        let mut prev_cur_dx: i32 = 0;
-        let mut prev_cur_dy: i32 = 0;
 
         loop {
-
             let mut proc_alive = false;
             if let Some(ref mut proc) = pcsx2 {
                 if proc.is_still_alive() {
@@ -118,8 +116,6 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 if was_injecting {
                     was_injecting = false;
                     unsafe { ClipCursor(std::ptr::null()) };
-                    prev_cur_dx = 0;
-                    prev_cur_dy = 0;
                     state.is_injecting.store(false, Ordering::Relaxed);
                     accumulator.reset();
                 }
@@ -222,6 +218,7 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                     was_injecting = true;
                     state.is_injecting.store(true, Ordering::Relaxed);
                     accumulator.reset();
+                    crate::raw_input::ensure_raw_input_registered();
                     crate::log("Injection ACTIVATED (PCSX2 in foreground and emulation active)");
 
                     unsafe {
@@ -242,6 +239,8 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                             };
                         }
                         SetCursorPos(lock_pos.x, lock_pos.y);
+                        last_cur = lock_pos;
+                        suppress_cursor_frames = 5;
                     }
                 }
 
@@ -249,71 +248,74 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 let game = &games[game_idx];
                 let tickrate = game.tickrate_ms();
 
+                // 1. Hardware Raw Input
                 let (raw_dx, raw_dy) = accumulator.take();
 
+                // 2. Cursor position tracking (frame-to-frame delta fallback)
                 let mut cur = POINT { x: 0, y: 0 };
-                unsafe { GetCursorPos(&mut cur) };
-                let cur_dx = cur.x - lock_pos.x;
-                let cur_dy = cur.y - lock_pos.y;
+                let cur_ok = unsafe { GetCursorPos(&mut cur) != 0 };
 
-                if cur_dx != 0 || cur_dy != 0 || lock_counter.is_multiple_of(10) {
-                    unsafe { SetCursorPos(lock_pos.x, lock_pos.y) };
+                let (cur_dx, cur_dy) = if cur_ok && suppress_cursor_frames == 0 {
+                    let d_x = cur.x - last_cur.x;
+                    let d_y = cur.y - last_cur.y;
+                    // Glitch / click-warp rejection: at 1ms tickrate, no human hand can move > 35 px/ms.
+                    // Clicking or window message handling can create momentary > 40px leaps.
+                    if d_x.abs() > 35 || d_y.abs() > 35 {
+                        (0, 0)
+                    } else {
+                        (d_x, d_y)
+                    }
+                } else {
+                    (0, 0)
+                };
+
+                if suppress_cursor_frames > 0 {
+                    suppress_cursor_frames -= 1;
+                }
+                if cur_ok {
+                    last_cur = cur;
+                }
+
+                // 3. Recenter cursor if it drifts away from center (threshold: 80 pixels)
+                // or periodically every 50 ticks to keep cursor near center of PCSX2 window
+                let drift_x = (cur.x - lock_pos.x).abs();
+                let drift_y = (cur.y - lock_pos.y).abs();
+                if drift_x > 80 || drift_y > 80 || lock_counter % 50 == 0 {
+                    unsafe {
+                        SetCursorPos(lock_pos.x, lock_pos.y);
+                    }
+                    last_cur = lock_pos;
+                    suppress_cursor_frames = 2; // suppress next 2 frames while SetCursorPos applies
                 }
                 lock_counter = lock_counter.wrapping_add(1);
 
-                let is_click_glitch = cur.x > 10_000
-                    || cur.y > 10_000
-                    || cur.x < -10_000
-                    || cur.y < -10_000
-                    || cur_dx.abs() > 500
-                    || cur_dy.abs() > 350
-                    || (prev_cur_dx.abs() < 20 && cur_dx.abs() > 250)
-                    || (prev_cur_dy.abs() < 20 && cur_dy.abs() > 180);
-
-                let valid_cur_dx = if is_click_glitch { 0 } else { cur_dx };
-                let valid_cur_dy = if is_click_glitch { 0 } else { cur_dy };
-
-                if is_click_glitch {
-                    prev_cur_dx = 0;
-                    prev_cur_dy = 0;
-                    unsafe { SetCursorPos(lock_pos.x, lock_pos.y) };
-                } else {
-                    prev_cur_dx = valid_cur_dx;
-                    prev_cur_dy = valid_cur_dy;
+                // Periodic Raw Input registration refresh every 500 ticks (~500ms)
+                if lock_counter % 500 == 0 {
+                    crate::raw_input::ensure_raw_input_registered();
                 }
 
-                let dx = if raw_dx != 0 && raw_dx.abs() <= 500 {
-                    raw_dx
+                // 4. Select delta: prefer Raw Input if non-zero; otherwise fall back to safe frame delta
+                let (dx, dy) = if raw_dx != 0 || raw_dy != 0 {
+                    (raw_dx.clamp(-500, 500), raw_dy.clamp(-350, 350))
                 } else {
-                    valid_cur_dx
-                };
-                let dy = if raw_dy != 0 && raw_dy.abs() <= 350 {
-                    raw_dy
-                } else {
-                    valid_cur_dy
+                    (cur_dx.clamp(-35, 35), cur_dy.clamp(-35, 35))
                 };
 
-                if dx != 0 || dy != 0 || is_click_glitch || cur_dx.abs() > 30 || cur_dy.abs() > 30 {
+                if dx != 0 || dy != 0 {
                     static LAST_INPUT_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     let last = LAST_INPUT_LOG.load(Ordering::Relaxed);
-                    let is_flick = dx.abs() > 40 || dy.abs() > 40 || cur_dx.abs() > 40 || cur_dy.abs() > 40 || is_click_glitch;
+                    let is_flick = dx.abs() > 35 || dy.abs() > 35;
 
                     if is_flick || now_ms.saturating_sub(last) >= 200 {
                         LAST_INPUT_LOG.store(now_ms, Ordering::Relaxed);
-                        let tag = if is_click_glitch {
-                            "[CLICK GLITCH BLOCKED]"
-                        } else if is_flick {
-                            "[FAST/FLICK INPUT]"
-                        } else {
-                            "[INPUT]"
-                        };
+                        let src = if raw_dx != 0 || raw_dy != 0 { "raw" } else { "cursor_fallback" };
                         crate::log(&format!(
-                            "{} cur=({},{}) lock=({},{}) cur_delta=({},{}) raw=({},{}) -> applied=({},{})",
-                            tag, cur.x, cur.y, lock_pos.x, lock_pos.y, cur_dx, cur_dy, raw_dx, raw_dy, dx, dy
+                            "[INPUT:{}] raw=({},{}) cur=({},{}) -> applied=({},{})",
+                            src, raw_dx, raw_dy, cur_dx, cur_dy, dx, dy
                         ));
                     }
                 }
@@ -329,8 +331,6 @@ pub fn spawn_injector_thread(state: Arc<SharedState>) -> std::thread::JoinHandle
                 if was_injecting {
                     was_injecting = false;
                     unsafe { ClipCursor(std::ptr::null()) };
-                    prev_cur_dx = 0;
-                    prev_cur_dy = 0;
                     state.is_injecting.store(false, Ordering::Relaxed);
                     accumulator.reset();
                     let reason = if is_paused {
